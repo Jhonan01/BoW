@@ -5,14 +5,16 @@ from sklearn.cluster import MiniBatchKMeans
 from sklearn.neighbors import BallTree
 import joblib
 import time
+import torch
 import pandas as pd
+from models.superpoint import SuperPoint  # do repo da MagicLeap
 
 # ----------------------------
 # Configurações
 # ----------------------------
 train_dir = Path('E:/MVP1_2024')              # imagens para treino (BoW)
 query_dir = Path('E:/nadir_images')           # imagens para consulta
-preprocessed_dir = Path('E:/MVP1_2024/preprocessed_orb')  # Mude o nome para não sobrescrever
+preprocessed_dir = Path('E:/MVP1_2024/preprocessed')
 ground_truth_file = Path('E:/MVP1_2024/ground_truth_mvp1.csv')
 
 n_clusters = 1000
@@ -21,17 +23,27 @@ n_matches = 5
 force_preprocess = False
 
 # ----------------------------
-# ORB
+# SuperPoint
 # ----------------------------
-orb = cv2.ORB_create(nfeatures=max_keypoints)
-print("Loaded ORB detector")
+superpoint_config = {
+    'descriptor_dim': 256,
+    'nms_radius': 4,
+    'keypoint_threshold': 0.005,
+    'max_keypoints': max_keypoints,
+}
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+superpoint = SuperPoint(superpoint_config).to(device)
+superpoint.eval()
+print("Loaded SuperPoint model")
 
 # ----------------------------
 # Gabarito (Ground Truth)
 # ----------------------------
 if ground_truth_file.exists():
     gt_df = pd.read_csv(ground_truth_file)
+    # Normaliza nomes removendo extensões .png, se existirem
     gt_df = gt_df.apply(lambda x: x.str.replace('.png', '', regex=False))
+    # Usa nomes reais das queries (sem .png)
     query_paths = sorted(
         query_dir.glob("*.png"),
         key=lambda x: int(x.stem) if x.stem.isdigit() else x.stem
@@ -40,6 +52,8 @@ if ground_truth_file.exists():
     ground_truth_lists = gt_df[['Top1', 'Top2', 'Top3', 'Top4', 'Top5']].values.tolist()
     gt_dict = dict(zip(query_names, ground_truth_lists))
     print(f"✅ Gabarito carregado: {len(gt_dict)} queries")
+    # Depuração: Mostrar algumas entradas do gabarito
+    print("Primeiras entradas do gabarito:", list(gt_dict.items())[:5])
 else:
     gt_dict = {}
     print("⚠️ Nenhum arquivo de gabarito encontrado, acurácia não será calculada.")
@@ -56,22 +70,24 @@ def load_image(path):
     img = cv2.resize(img, (640, 480))
     return img
 
-def extract_orb_descriptors(img):
-    keypoints, descriptors = orb.detectAndCompute(img, None)
-    if descriptors is None:
-        return np.zeros((0, 32), dtype=np.uint8)  # ORB = 32 floats binários
-    return descriptors.astype(np.float32)  # Converte para float para o k-means
+def extract_superpoint_descriptors(img):
+    img_torch = torch.from_numpy(img / 255.).float()[None, None].to(device)
+    with torch.no_grad():
+        outputs = superpoint({'image': img_torch})
+        desc = outputs['descriptors'][0].cpu().numpy().T  # (N, 256)
+    return desc.astype(np.float32) if desc is not None else np.zeros((0,256), dtype=np.float32)
 
 # ----------------------------
 # Pré-processamento
 # ----------------------------
 required_files = ['vocab.npy', 'histograms.npy', 'image_names.npy', 'kmeans_model.pkl']
-preprocessed_exists = all((preprocessed_dir / f).exists() for f in required_files)
+preprocessed_exists = all((preprocessed_dir / f).exists() for f in required_files) # Verifica se todos os arquivos
 
 if not preprocessed_exists or force_preprocess:
     print("Pré-processamento iniciado...")
-    preprocessed_dir.mkdir(parents=True, exist_ok=True)
+    preprocessed_dir.mkdir(parents=True, exist_ok=True) # Cria pasta se não existir
 
+    # Ordena numericamente os nomes dos arquivos
     train_paths = sorted(
         train_dir.glob("*.png"),
         key=lambda x: int(x.stem.split("_")[1]) if "_" in x.stem else int(x.stem)
@@ -80,30 +96,32 @@ if not preprocessed_exists or force_preprocess:
     if len(train_paths) == 0:
         raise RuntimeError("Nenhuma imagem .png encontrada no diretório de treino!")
 
-    images = [(load_image(p), p.name) for p in train_paths]
-    image_names = [Path(name).stem for _, name in images]
+    images = [(load_image(p), p.name) for p in train_paths] # Carrega imagens em tons de cinza
+    image_names = [Path(name).stem for _, name in images]  # Pega nomes das imagens sem extensão
 
     all_descriptors = []
     descriptors_dict = {}
     for img, name in images:
-        desc = extract_orb_descriptors(img)
+        desc = extract_superpoint_descriptors(img)
         if desc.shape[0] > 0:
             all_descriptors.append(desc)
-        descriptors_dict[Path(name).stem] = desc
+        # Cria um dicionário onde a chave é o nome da imagem para saber quais descritores pertencem a qual imagem
+        descriptors_dict[Path(name).stem] = desc 
 
-    all_descriptors = np.vstack(all_descriptors)
+    all_descriptors = np.vstack(all_descriptors) # Concatena todos os descritores
     print(f"Descritores concatenados: {all_descriptors.shape}")
 
+    # Inicializa o kmeans
     kmeans = MiniBatchKMeans(
         n_clusters=n_clusters, random_state=0, batch_size=1000
     ).fit(all_descriptors)
-    vocab = kmeans.cluster_centers_
+    vocab = kmeans.cluster_centers_ # Cria o vocabulário (Centríoides "palavras visuais")
 
     histograms = []
     for name in image_names:
         desc = descriptors_dict[name]
         if desc.shape[0] > 0:
-            labels = kmeans.predict(desc)
+            labels = kmeans.predict(desc) ##Encontra o centróide mais próximo para cada descritor
             hist, _ = np.histogram(labels, bins=n_clusters, range=(0,n_clusters), density=True)
         else:
             hist = np.zeros(n_clusters)
@@ -120,9 +138,11 @@ else:
     vocab = np.load(preprocessed_dir / 'vocab.npy')
     histograms = np.load(preprocessed_dir / 'histograms.npy')
     image_names = np.load(preprocessed_dir / 'image_names.npy', allow_pickle=True)
-    image_names = [Path(name).stem for name in image_names]
+    image_names = [Path(name).stem for name in image_names]  # Normaliza: remove extensões
     kmeans = joblib.load(preprocessed_dir / 'kmeans_model.pkl')
     print(f"{len(image_names)} imagens de treino carregadas, {vocab.shape[0]} clusters.")
+    # Depuração: Mostrar algumas image_names
+    print("Primeiras image_names:", image_names[:5])
 
 # ----------------------------
 # BallTree para busca
@@ -140,9 +160,9 @@ total_queries = 0
 total_acertos_top5 = 0
 
 for query_path in query_paths:
-    query_name = query_path.name.replace('.png', '')
+    query_name = query_path.name.replace('.png', '')  # Normaliza nome
     query_img = load_image(query_path)
-    query_desc = extract_orb_descriptors(query_img)
+    query_desc = extract_superpoint_descriptors(query_img)
 
     if query_desc.shape[0] == 0:
         print(f"Sem descritores: {query_name}")
@@ -156,23 +176,34 @@ for query_path in query_paths:
     elapsed = time.time() - start_time
 
     top_matches = [(image_names[i], distances[0][j]) for j, i in enumerate(indices[0])]
+
     print(f"\nQuery: {query_name} | tempo: {elapsed:.4f}s")
     for rank, (name, dist) in enumerate(top_matches):
         print(f" {rank+1}. {name} (dist={dist:.4f})")
 
+    # Checar gabarito
     if query_name in gt_dict:
         total_queries += 1
         expected_list = gt_dict[query_name]
+        # Depuração: Mostrar correspondências e gabarito
+        print(f"Top-5 retornadas: {[m[0] for m in top_matches]}")
+        print(f"Gabarito Top-5: {expected_list}")
+        print(f"Antes da query {query_name}: Top-5 acertos={total_acertos_top5}, queries={total_queries-1}")
         if any(gt in [m[0] for m in top_matches] for gt in expected_list):
-            total_acertos_top5 += 1
             print(f"✅ ACERTOU Top-5! GT = {expected_list}")
+            total_acertos_top5 += 1
         else:
             print(f"❌ ERROU Top-5! GT = {expected_list}")
-        acc_top5 = total_acertos_top5 / total_queries * 100
-        print(f"📊 Acurácia Top-5: {acc_top5:.2f}% ({total_acertos_top5}/{total_queries})")
 
+        acc_top5 = total_acertos_top5 / total_queries * 100 if total_queries > 0 else 0
+        print(f"Depois da query {query_name}: Top-5 acertos={total_acertos_top5}, queries={total_queries}")
+        print(f"📊 Acurácia Top-5: {acc_top5:.2f}% ({total_acertos_top5}/{total_queries})")
+    else:
+        print(f"⚠️ Query {query_name} não encontrada no gabarito! Ignorando para acurácia.")
+
+    # Visualização lado a lado
     best_match_name = top_matches[0][0]
-    best_match_img = load_image(train_dir / (best_match_name + '.png'))
+    best_match_img = load_image(train_dir / (best_match_name + '.png'))  # Adiciona extensão
     combined = np.hstack((query_img, best_match_img))
     cv2.imshow("Query | Melhor correspondência", combined)
 
